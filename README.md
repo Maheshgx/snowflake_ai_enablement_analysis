@@ -114,13 +114,13 @@ snowflake_ai_enablement_analysis/
 
 | Metric | Value |
 |--------|-------|
-| Databases Analyzed | 67 |
-| Schemas Analyzed | 937 |
-| Tables/Views | 13,927 |
-| Total Columns | 424,279 |
-| Data Stages | 269 |
-| AI Candidates Identified | 149,342 |
-| Schema Reports Generated | 921 |
+| Databases Analyzed | XXX |
+| Schemas Analyzed | XXX |
+| Tables/Views | XXX |
+| Total Columns | XXX |
+| Data Stages | XXX |
+| AI Candidates Identified | XXX |
+| Schema Reports Generated | XXX |
 
 ## Data Analysis Features
 
