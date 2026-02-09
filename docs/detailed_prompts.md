@@ -1,7 +1,7 @@
 # Snowflake AI Readiness Agent - System Instructions
 
-> **Generated On:** 2026-02-06 07:14 UTC  
-> **Agent Version:** 2.0  
+> **Generated On:** 2026-02-09 UTC  
+> **Agent Version:** 2.1  
 > **Document Type:** Agent System Prompt & Instructions
 
 ---
@@ -53,7 +53,7 @@ CORE DIRECTIVES:
      * snowflake-ai-enablement-reports/reports/      - Analysis reports
      * snowflake-ai-enablement-reports/profiles/     - Schema profiles
      * snowflake-ai-enablement-reports/logs/         - Audit trail & logs
-   - Configurable via config.yaml: output.directory
+   - Configurable via config/config.yaml: output.directory
 
 7. RUN MODE HANDLING (CRITICAL):
    - Two modes available: "fresh" and "append"
@@ -78,7 +78,7 @@ CORE DIRECTIVES:
      * merge_candidates() - Merge new with existing (deduplicated)
      * save_run_history() - Track incremental runs
    
-   - Configurable via config.yaml: run_mode.mode, run_mode.append_strategy
+   - Configurable via config/config.yaml: run_mode.mode, run_mode.append_strategy
 
 8. PROGRESS TRACKING (USER EXPERIENCE):
    - Display real-time progress during long-running operations
@@ -117,13 +117,13 @@ EXECUTION PHASES:
 Phase 1:  Metadata Discovery (databases, schemas, tables, columns)
 Phase 2:  AI Candidate Identification
 Phase 2A: Load Analysis Cache
-Phase 2B: Sampling Pass (data quality analysis)
+Phase 2B: Metadata-Based Analysis (no table scans - uses ACCOUNT_USAGE metadata)
 Phase 2C: Save Analysis Cache
 Phase 2D: Identify Top Candidates
-Phase 2E: Full Scan Analysis
-Phase 2F: Generate Data Analysis Reports
+Phase 2E: Metadata-Based Enhanced Scoring (no table scans)
+Phase 2F: Generate Data Analysis Reports (incl. AI Readiness Metadata Report)
 Phase 3:  Enhanced Analysis (text-rich columns, education tables, PII)
-Phase 4:  Data Profiling (text and variant column profiling)
+Phase 4:  Metadata-Based Data Profiling (no table scans)
 Phase 5:  Scoring Candidates
 Phase 5B: Flagging Confirmed Candidates
 Phase 6:  Report Generation (all with UTC timestamps)
@@ -134,7 +134,7 @@ The agent supports restarting from any stage using --start-stage option.
 
 Valid stages: 1, 2, 2A, 2B, 2C, 2D, 2E, 2F, 3, 4, 5, 5B, 6
 
-Usage: python scripts/snowflake_full_analysis.py --start-stage 2B
+Usage: python3 scripts/snowflake_full_analysis.py --start-stage 2B
 
 When restarting from a later stage:
 - Agent loads intermediate state from previous run files
@@ -147,12 +147,27 @@ Key functions for stage restart:
 - VALID_STAGES constant - Defines execution order
 - STAGE_ORDER dict - Maps stage to execution sequence
 
+METADATA-ONLY ANALYSIS (v2.1):
+-------------------------------
+All data evaluation uses metadata views instead of table scans:
+- SNOWFLAKE.ACCOUNT_USAGE.TABLES (freshness, clustering, row count)
+- SNOWFLAKE.ACCOUNT_USAGE.COLUMNS (data types, comments, nullability)
+- SNOWFLAKE.ACCOUNT_USAGE.TABLE_CONSTRAINTS (PK, FK, UNIQUE)
+- SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS (storage, clustering depth)
+- INFORMATION_SCHEMA.COLUMNS / TABLES (real-time per-database checks)
+
+Module: scripts/snowflake_ai_readiness_metadata.py
+- run_metadata_analysis() - Orchestrates all metadata fetching and scoring
+- compute_table_readiness_score() - Per-table AI readiness (0-100)
+- compute_column_metadata_stats() - Replaces run_adaptive_sample()
+- enhance_data_readiness_score_metadata() - Replaces enhance_data_readiness_score()
+- generate_readiness_report_markdown() - New readiness report
+
 SAFETY CONSTRAINTS:
 -------------------
 - Reject any non-SELECT queries
 - Log all queries to audit trail
-- Use SAMPLE/LIMIT for efficiency
-- Respect configured timeouts
+- Metadata-only queries (no production table access)
 - Cache results to avoid redundant analysis
 
 ===============================================================================
@@ -199,7 +214,52 @@ Please refactor the existing utility code and its internal instructions with the
 
 ---
 
-### Stage Restart Feature Prompt (v2.1)
+### Metadata-Only Refactoring Prompt (v2.1)
+
+```
+I have a Python-based utility that evaluates Snowflake tables for 'AI Readiness'
+(checking for descriptions, compatible data types, and data freshness). Currently,
+it executes SELECT queries on production tables, which is driving up credit
+consumption. Please refactor the logic to use Snowflake Metadata instead of
+table scans. Specifically:
+
+Replace Table Scans: Instead of querying actual tables, query
+INFORMATION_SCHEMA.COLUMNS, INFORMATION_SCHEMA.TABLES, and
+SNOWFLAKE.ACCOUNT_USAGE.TABLE_CONSTRAINTS.
+
+Evaluation Criteria: Use metadata to check for:
+- Presence of Comments: (e.g., COMMENT column) to ensure LLMs have context.
+- Data Types: Identify unsupported types for vectorization or LLM processing.
+- Freshness: Use LAST_ALTERED or STALE_STATS_INFO to ensure the data is current.
+- Clustering/Partitioning: Check if the table is optimized for large-scale retrieval.
+- Efficiency: Ensure the queries target the INFORMATION_SCHEMA for real-time checks
+  or ACCOUNT_USAGE for historical/account-wide audits.
+
+Output: Provide the refactored SQL queries and a Python snippet showing how to
+parse these metadata results into a 'Readiness Score'.
+```
+
+**Implementation Result:**
+- Created `scripts/snowflake_ai_readiness_metadata.py` — standalone metadata evaluation module
+- 6 SQL query templates targeting ACCOUNT_USAGE and INFORMATION_SCHEMA views
+- Per-table AI Readiness Score (0–100) across 5 weighted dimensions:
+  - Comments (25%), Data Types (20%), Freshness (25%), Clustering (15%), Constraints (15%)
+- Lookup builders: `build_table_metadata_lookup()`, `build_column_metadata_lookup()`, `build_constraints_lookup()`, `build_storage_lookup()`
+- `compute_column_metadata_stats()` replaces `run_adaptive_sample()` (zero table scans)
+- `enhance_data_readiness_score_metadata()` replaces `enhance_data_readiness_score()`
+- `run_metadata_analysis()` orchestrates all 4 metadata queries and scoring
+- `generate_readiness_report_markdown()` produces the new readiness report
+- Refactored `run_agent()` in main script:
+  - Phase 2B: Replaced per-candidate table scans with `run_metadata_analysis()`
+  - Phase 2E: Replaced `run_full_scan_analysis()` with metadata-based enhanced scoring
+  - Phase 4: Replaced `profile_sample_text_columns()` / `profile_variant_columns()` with metadata estimates
+  - Phase 2F: Added `ai_readiness_metadata_report.md` and `table_readiness_scores.json` outputs
+- SELECT access to individual tables no longer required
+- ~95%+ credit reduction (4 metadata queries vs. N×3 table scans)
+
+---
+
+### Stage Restart Feature Prompt (v2.2)
 
 ```
 Update code to restart from any stage like from 2B or 2C.
@@ -241,11 +301,11 @@ Objective 1: Configuration & Connectivity Overhaul
 
 Refactor Connection Logic: Modify the main connection module to read credentials and settings from a YAML configuration file.
 
-File Standard: Create a config.example.yaml template file in the root directory. This template should include placeholders for Snowflake account details (account, user, password/key, warehouse, role) and analysis parameters.
+File Standard: Create a config/config.example.yaml template file in the config/ directory. This template should include placeholders for Snowflake account details (account, user, password/key, warehouse, role) and analysis parameters.
 
-Implementation: Ensure the script looks for a config.yaml file (and includes this in .gitignore) for local execution.
+Implementation: Ensure the script looks for a config/config.yaml file (and includes this in .gitignore) for local execution.
 
-Database Filtering: Implement a specific parameter in the config.yaml (e.g., target_databases: [DB1, DB2]) that allows the user to specify a list of databases to analyze.
+Database Filtering: Implement a specific parameter in the config/config.yaml (e.g., target_databases: [DB1, DB2]) that allows the user to specify a list of databases to analyze.
 
 If the list is empty or commented out, the script should default to analyzing all accessible databases.
 
@@ -287,7 +347,7 @@ Output Deliverables:
 
 Updated Python source code files.
 
-config.example.yaml file.
+config/config.example.yaml file.
 
 docs/detailed_prompts.md file.
 ```
@@ -301,26 +361,27 @@ docs/detailed_prompts.md file.
 **To Run**
 
 **Dry Run (Recommended First):**
-1. Copy `config.example.yaml` to `config.yaml`
+1. Copy `config/config.example.yaml` to `config/config.yaml`
 2. Fill in your Snowflake credentials
-3. Set `dry_run.enabled: true` in config.yaml
-4. Run: `python scripts/snowflake_full_analysis.py`
+3. Set `dry_run.enabled: true` in config/config.yaml
+4. Run: `python3 scripts/snowflake_full_analysis.py`
 5. Review the scope and estimated runtime
 
 **Full Analysis:**
 1. After successful dry run, set `dry_run.enabled: false`
 2. Optionally set `target_databases` to filter which databases to analyze
-3. Run: `python scripts/snowflake_full_analysis.py`
+3. Run: `python3 scripts/snowflake_full_analysis.py`
 
 **Files Modified/Created:**
-- `config.example.yaml` - YAML configuration template with all settings
+- `config/config.example.yaml` - YAML configuration template with all settings
 - `scripts/snowflake_full_analysis.py` - Refactored connection logic
-- `.gitignore` - Added `config.yaml` to ignore list
+- `.gitignore` - Added `config/config.yaml` to ignore list
 
 **Key Features Implemented:**
 1. **YAML Configuration Loading** (`load_yaml_config()`)
-   - Loads from `config.yaml` in repo root
-   - Falls back to `config.example.yaml` with warning
+   - Loads from `config/config.yaml` (primary)
+   - Falls back to repo root `config.yaml` (backward compatibility)
+   - Falls back to `config/config.example.yaml` with warning
    - Falls back to environment variables for backwards compatibility
 
 2. **Database Filtering** (`target_databases` parameter)
@@ -335,33 +396,53 @@ docs/detailed_prompts.md file.
 
 ### Objective 2: Deep Data Analysis (Data Profiling)
 
-**Functions Implemented:**
-1. **`classify_sparsity()`** - Classifies NULL percentage into low/medium/high/very_high
-2. **`classify_cardinality()`** - Classifies unique ratio into low/medium/high
-3. **`classify_content_type()`** - Determines if text is codes, short_text, meaningful_text, or rich_content
-4. **`run_deep_profiling()`** - Comprehensive profiling with:
-   - Sparsity analysis (NULL rate)
-   - Cardinality analysis (using HLL for efficiency)
-   - Content type detection for text columns
-   - JSON structure validation for VARIANT columns
-   - Natural language detection via space analysis
-5. **`is_confirmed_candidate()`** - Determines if data supports metadata hypothesis
+**Functions Implemented (Metadata-Based, v2.1):**
 
-**Profiling Heuristics:**
-- **Sparsity Thresholds:** ≤10% NULL = low, ≤30% = medium, ≤70% = high, >70% = very_high
-- **Cardinality Thresholds:** ≤1% unique = low, ≥90% unique = high
-- **Content Type:** <10 chars = codes, <50 = short_text, <200 = meaningful_text, ≥200 = rich_content
-- **Natural Language Detection:** Checks for spaces in sampled values
+In `scripts/snowflake_ai_readiness_metadata.py`:
+1. **`fetch_tables_metadata()`** - Queries ACCOUNT_USAGE.TABLES for freshness, clustering, row count
+2. **`fetch_columns_metadata()`** - Queries ACCOUNT_USAGE.COLUMNS for data types, comments, nullability
+3. **`fetch_table_constraints()`** - Queries ACCOUNT_USAGE.TABLE_CONSTRAINTS for PK/FK/UNIQUE
+4. **`fetch_table_storage_metrics()`** - Queries ACCOUNT_USAGE.TABLE_STORAGE_METRICS for storage info
+5. **`build_table_metadata_lookup()`** - Parses table rows into (db, schema, table) keyed dict
+6. **`build_column_metadata_lookup()`** - Parses column rows into (db, schema, table) keyed dict
+7. **`build_constraints_lookup()`** - Parses constraint rows into lookup dict
+8. **`build_storage_lookup()`** - Parses storage metrics into lookup dict
+9. **`score_comments()`** - Scores table/column comment presence (0–100)
+10. **`score_data_types()`** - Scores data type AI compatibility (0–100)
+11. **`score_freshness()`** - Scores data currency via LAST_ALTERED (0–100)
+12. **`score_clustering()`** - Scores clustering/partitioning optimization (0–100)
+13. **`score_constraints()`** - Scores constraint presence (0–100)
+14. **`compute_table_readiness_score()`** - Weighted total across all 5 dimensions
+15. **`compute_column_metadata_stats()`** - Replaces `run_adaptive_sample()` (zero table scans)
+16. **`enhance_data_readiness_score_metadata()`** - Replaces `enhance_data_readiness_score()`
+17. **`run_metadata_analysis()`** - Orchestrates full metadata-based analysis
+18. **`generate_readiness_report_markdown()`** - Generates readiness report
 
-**Confirmation Criteria:**
-- Sparsity ≤ 50% NULL
-- Average text length ≥ 30 characters (for text columns)
-- Natural language content detected (for LLM candidates)
-- Valid JSON structure (for VARIANT columns)
+Legacy functions preserved as dead code in main script:
+- `classify_sparsity()`, `classify_cardinality()`, `classify_content_type()`
+- `run_deep_profiling()`, `run_adaptive_sample()`, `run_full_scan_analysis()`
+- `profile_sample_text_columns()`, `profile_variant_columns()`
+- `is_confirmed_candidate()` (still called for confirmation logic)
+
+**AI Readiness Scoring (Per-Table, 0–100):**
+
+| Dimension | Weight | Source |
+|-----------|--------|--------|
+| Comments | 25% | COMMENT on tables/columns |
+| Data Types | 20% | DATA_TYPE compatibility |
+| Freshness | 25% | LAST_ALTERED |
+| Clustering | 15% | CLUSTERING_KEY |
+| Constraints | 15% | TABLE_CONSTRAINTS |
+
+**Confirmation Criteria (metadata-derived):**
+- Estimated sparsity ≤ 50% (from IS_NULLABLE)
+- Estimated text length ≥ 30 characters (from CHARACTER_MAXIMUM_LENGTH)
 - Data readiness score ≥ 3.5
 
 **Output:**
-- `confirmed_candidates.json` - Candidates where data supports metadata hypothesis
+- `confirmed_candidates.json` - Candidates where metadata supports AI hypothesis
+- `table_readiness_scores.json` - Per-table readiness scores (NEW)
+- `ai_readiness_metadata_report.md` - Readiness report (NEW)
 - `is_confirmed_candidate` flag on all candidates
 - `confirmation_reasons` list explaining the determination
 
@@ -374,7 +455,7 @@ docs/detailed_prompts.md file.
 
 ## Configuration Reference
 
-### config.yaml Structure
+### config/config.yaml Structure
 
 ```yaml
 # Snowflake Connection
@@ -402,11 +483,8 @@ exclude_databases:  # Blacklist - exclude these
 
 # Analysis Settings
 analysis:
-  sample_timeout: 300
-  full_scan_timeout: 900
   top_candidates_full_scan: 200
   force_reanalysis: false
-  sample_sizes: [10000, 1000, 100]
 
 # Profiling Thresholds (Objective 2)
 profiling:
@@ -430,14 +508,15 @@ profiling:
 
 ## Efficiency Considerations
 
-All data profiling queries follow best practices for minimizing compute costs:
+Since v2.1, all analysis uses metadata-only queries for maximum efficiency:
 
-1. **SAMPLE clause** - Used for all profiling queries (10K, 1K, or 100 rows)
-2. **HLL (HyperLogLog)** - Used for cardinality estimation instead of COUNT(DISTINCT)
-3. **LIMIT clause** - Applied to content sampling queries
-4. **Adaptive sampling** - Falls back to smaller samples on timeout
+1. **Metadata-only queries** - ACCOUNT_USAGE and INFORMATION_SCHEMA views only (no table scans)
+2. **4 total queries** - Replaces N×3 per-table SAMPLE/SELECT queries
+3. **~95%+ credit reduction** - Metadata views consume minimal compute
+4. **In-memory lookups** - Parsed metadata stored in dicts keyed by (db, schema, table)
 5. **Caching** - Results cached to avoid re-analysis on subsequent runs
 6. **Early filtering** - Database filter applied in SQL WHERE clause, not post-query
+7. **No SELECT on tables required** - Simplified permission model
 
 ---
 
@@ -461,6 +540,7 @@ All reports are generated in `snowflake-ai-enablement-reports/`:
 | `reports/executive_summary.md` | High-level findings and recommendations |
 | `reports/detailed_analysis_report.md` | Comprehensive analysis with full reasoning |
 | `reports/ai_strategy_roadmap.md` | Phased implementation plan |
+| `reports/ai_readiness_metadata_report.md` | Per-table AI readiness scores (NEW) |
 | `reports/data_quality_dashboard.md` | Data quality insights |
 | `reports/scoring_comparison.md` | Before/after scoring analysis |
 | `profiles/*.md` | Per-schema analysis reports |
@@ -468,6 +548,7 @@ All reports are generated in `snowflake-ai-enablement-reports/`:
 | `metadata/all_candidates.json` | All AI candidates |
 | `metadata/confirmed_candidates.json` | Data-validated candidates |
 | `metadata/enhanced_text_candidates.json` | LLM/Search candidates |
+| `metadata/table_readiness_scores.json` | Per-table AI readiness scores (NEW) |
 | `metadata/full_inventory.csv` | Complete column inventory |
 | `metadata/stages_inventory.csv` | All Snowflake stages |
 | `metadata/data_analysis_cache.json` | Analysis cache |

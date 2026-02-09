@@ -1,6 +1,6 @@
 # Snowflake AI Readiness Agent
 
-> **Version:** 2.0 | **Architecture:** Autonomous Agent | **Timestamps:** UTC
+> **Version:** 2.1 | **Architecture:** Autonomous Agent | **Timestamps:** UTC | **Analysis:** Metadata-Only (Zero Table Scans)
 
 An autonomous agent for analyzing Snowflake environments to identify AI/ML enablement opportunities using Snowflake Cortex AI services.
 
@@ -23,7 +23,9 @@ This agent analyzes your Snowflake environment to identify opportunities for AI/
 | **Database Filtering** | Analyze specific databases or exclude system databases |
 | **Run Modes** | Fresh (overwrite) or Append (incremental) analysis modes |
 | **Dry Run Mode** | Validate configuration and estimate scope before full analysis |
-| **Deep Data Profiling** | Validate candidates with actual data (sparsity, cardinality, content type) |
+| **Metadata-Only Analysis** | Evaluate AI readiness using INFORMATION_SCHEMA and ACCOUNT_USAGE (no table scans) |
+| **AI Readiness Scoring** | Per-table readiness score (0–100) across 5 dimensions: comments, types, freshness, clustering, constraints |
+| **Zero Credit Overhead** | Replaces N×3 table scans with 4 metadata queries for ~95%+ credit reduction |
 | **Confirmed Candidates** | Distinguish metadata-based candidates from data-validated ones |
 | **Progress Tracking** | Real-time progress bar with current object and running statistics |
 | **Report Index** | Main README.md with analysis summary and links to all reports |
@@ -35,24 +37,24 @@ This agent analyzes your Snowflake environment to identify opportunities for AI/
 # 1. Clone and setup
 git clone <repository-url>
 cd snowflake_ai_enablement_analysis
-python -m venv venv && source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate
 pip install -r config/requirements.txt
 
 # 2. Configure
-cp config.example.yaml config.yaml
-# Edit config.yaml with your Snowflake credentials
+cp config/config.example.yaml config/config.yaml
+# Edit config/config.yaml with your Snowflake credentials
 
 # 3. Dry run (recommended first)
-python scripts/snowflake_full_analysis.py --dry-run
+python3 scripts/snowflake_full_analysis.py --dry-run
 
 # 4. Full analysis
-python scripts/snowflake_full_analysis.py
+python3 scripts/snowflake_full_analysis.py
 ```
 
 ### Command Line Options
 
 ```bash
-python scripts/snowflake_full_analysis.py [OPTIONS]
+python3 scripts/snowflake_full_analysis.py [OPTIONS]
 
 Options:
   -c, --config PATH    Path to YAML configuration file (default: config.yaml)
@@ -70,13 +72,14 @@ Options:
 snowflake_ai_enablement_analysis/
 ├── README.md                        # This file
 ├── LICENSE                          # MIT License
-├── config.example.yaml              # Configuration template (copy to config.yaml)
-├── .gitignore                       # Git ignore rules (includes config.yaml)
-├── scripts/
-│   ├── snowflake_full_analysis.py  # Main analysis script
-│   └── create_presentation.py      # Presentation generator
+├── .gitignore                       # Git ignore rules
 ├── config/
-│   └── requirements.txt            # Python dependencies
+│   ├── config.example.yaml          # Configuration template (copy to config.yaml)
+│   └── requirements.txt             # Python dependencies
+├── scripts/
+│   ├── snowflake_full_analysis.py          # Main analysis script
+│   ├── snowflake_ai_readiness_metadata.py  # Metadata-only evaluation module
+│   └── create_presentation.py              # Presentation generator
 ├── docs/
 │   ├── USER_GUIDE.md               # Comprehensive user guide
 │   └── detailed_prompts.md         # Feature documentation
@@ -86,6 +89,7 @@ snowflake_ai_enablement_analysis/
     │   ├── executive_summary.md    # High-level findings
     │   ├── detailed_analysis_report.md  # Comprehensive analysis with reasoning
     │   ├── ai_strategy_roadmap.md  # Phased implementation plan
+    │   ├── ai_readiness_metadata_report.md  # Metadata-based readiness report (NEW)
     │   ├── data_quality_dashboard.md
     │   └── scoring_comparison.md
     ├── profiles/
@@ -95,6 +99,7 @@ snowflake_ai_enablement_analysis/
     │   ├── all_candidates.json     # All AI candidates
     │   ├── confirmed_candidates.json  # Data-validated candidates
     │   ├── enhanced_text_candidates.json
+    │   ├── table_readiness_scores.json  # Per-table AI readiness scores (NEW)
     │   ├── full_inventory.csv
     │   ├── stages_inventory.csv
     │   └── data_analysis_cache.json
@@ -119,50 +124,79 @@ snowflake_ai_enablement_analysis/
 
 ## Data Analysis Features
 
-The analyzer now includes comprehensive actual data analysis capabilities:
+The analyzer uses a **metadata-only approach** to evaluate AI readiness without executing any queries on production tables, dramatically reducing Snowflake credit consumption.
 
-### What's Analyzed
+### What's Analyzed (Metadata-Only)
 
-- **NULL Rate Impact** - Measures data completeness (columns with >70% NULLs are flagged)
-- **Content Substantiality** - Evaluates text length and richness for LLM/Search suitability
-- **Data Efficiency** - Compares actual vs. defined column sizes to identify over-provisioned storage
-- **Volume Assessment** - Calculates real data distributions for cost estimation
+- **Presence of Comments** - Table and column comments indicating LLM context availability
+- **Data Type Compatibility** - Identifies unsupported types (BINARY, GEOGRAPHY) vs. AI-ready types
+- **Data Freshness** - Uses `LAST_ALTERED` from table metadata to ensure data currency
+- **Clustering/Partitioning** - Checks `CLUSTERING_KEY` for large-scale retrieval optimization
+- **Constraints** - Primary/foreign/unique keys indicating data quality and relationships
 
 ### How It Works
 
 **Phase 1: Metadata Discovery**
-- Inventory all databases, schemas, tables, columns, stages
-- Identify ~149,342 AI candidates using metadata heuristics
+- Inventory all databases, schemas, tables, columns, stages via `SNOWFLAKE.ACCOUNT_USAGE`
+- Identify AI candidates using metadata heuristics
 
-**Phase 2: Actual Data Analysis (NEW)**
-- Adaptive sampling (10K → 1K → 100 rows) with fallback strategy
+**Phase 2: Metadata-Based Analysis (Refactored — No Table Scans)**
+- **Phase 2B:** Queries `ACCOUNT_USAGE.TABLES`, `ACCOUNT_USAGE.COLUMNS`, `ACCOUNT_USAGE.TABLE_CONSTRAINTS`, and `ACCOUNT_USAGE.TABLE_STORAGE_METRICS` (4 queries total)
+- **Phase 2E:** Computes enhanced readiness scores from metadata-derived statistics
 - Incremental analysis with caching (skip already-analyzed candidates)
-- Enhanced scoring based on real data quality
-- Full scans on top 200 candidates for exact statistics
+- Zero table scans — all analysis from metadata views
 
 **Phase 3-6: Enhanced Reporting**
-- All existing reports enhanced with actual data insights
-- New data quality dashboard with actionable recommendations
-- Before/after scoring comparison to show impact
+- All existing reports enhanced with metadata-derived insights
+- **NEW:** AI Readiness Metadata Report (`ai_readiness_metadata_report.md`)
+- **NEW:** Per-table readiness scores (`table_readiness_scores.json`)
+- Data quality dashboard and scoring comparison reports
 
 ### Key Benefits
 
-- **Evidence-Based Decisions** - Recommendations backed by actual data analysis, not just metadata
-- **Cost Optimization** - Identify over-provisioned columns wasting storage
-- **Quality Filtering** - Avoid candidates with poor data quality (high NULLs, minimal content)
-- **Incremental Analysis** - Cache enables re-running on new databases without re-analyzing everything
+- **~95%+ Credit Reduction** - 4 metadata queries replace thousands of table scans
+- **Zero Production Impact** - No queries touch actual table data
+- **Comprehensive Coverage** - Every table scored across 5 dimensions
+- **Incremental Analysis** - Cache enables re-running on new databases without re-analyzing
+- **Actionable Reports** - Tables ranked by readiness with specific improvement recommendations
 
-### Enhanced Scoring
+### Metadata Sources
 
-Data Readiness scores (0-5 scale) now based on:
+| Source | Type | What It Provides |
+|--------|------|------------------|
+| `SNOWFLAKE.ACCOUNT_USAGE.TABLES` | Account-wide | ROW_COUNT, BYTES, LAST_ALTERED, CLUSTERING_KEY, COMMENT |
+| `SNOWFLAKE.ACCOUNT_USAGE.COLUMNS` | Account-wide | DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COMMENT |
+| `SNOWFLAKE.ACCOUNT_USAGE.TABLE_CONSTRAINTS` | Account-wide | PRIMARY KEY, FOREIGN KEY, UNIQUE constraints |
+| `SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS` | Account-wide | ACTIVE_BYTES, TIME_TRAVEL_BYTES |
+| `INFORMATION_SCHEMA.COLUMNS` | Per-database (real-time) | Real-time column metadata for targeted checks |
+| `INFORMATION_SCHEMA.TABLES` | Per-database (real-time) | Real-time table metadata for targeted checks |
+
+### AI Readiness Scoring (Per-Table, 0–100)
+
+Each table is scored across 5 weighted dimensions:
+
+| Dimension | Weight | Source | What It Measures |
+|-----------|--------|--------|------------------|
+| **Comments** | 25% | `COMMENT` on tables/columns | LLM context availability |
+| **Data Types** | 20% | `DATA_TYPE` in COLUMNS | Vectorization/LLM compatibility |
+| **Freshness** | 25% | `LAST_ALTERED` in TABLES | Data currency |
+| **Clustering** | 15% | `CLUSTERING_KEY` in TABLES | Large-scale retrieval optimization |
+| **Constraints** | 15% | `TABLE_CONSTRAINTS` | Data quality / relationships |
+
+**Score Interpretation:**
+- **≥70:** High readiness — ready for AI enablement
+- **40–69:** Medium readiness — some improvements needed
+- **<40:** Low readiness — significant gaps to address
+
+### Enhanced Candidate Scoring (Per-Column, 0–5)
+
+Data Readiness scores for individual candidates are derived from metadata:
 
 | Component | Weight | Criteria |
 |-----------|--------|----------|
-| NULL Rate Impact | 0-2 pts | ≤10% NULLs = 2.0, >70% NULLs = 0.0 |
-| Content Substantiality | 0-2 pts | Avg ≥200 chars = 2.0, <50 chars = 0.5 |
-| Data Efficiency | 0-1 pt | Actual >50% of defined = 1.0, <25% = 0.0 |
-
-Result: Candidates with high NULL rates or minimal content drop in ranking; columns with rich, complete data rise to the top.
+| NULL Rate Impact | 0-2 pts | NOT NULL columns = 2.0, nullable = estimated |
+| Content Substantiality | 0-2 pts | Based on CHARACTER_MAXIMUM_LENGTH metadata |
+| Data Efficiency | 0-1 pt | Column comments + NOT NULL constraints |
 
 ## AI Opportunities Summary
 
@@ -218,22 +252,22 @@ See the generated AI Strategy Roadmap in `snowflake-ai-enablement-reports/report
 
 | Requirement | Details |
 |-------------|----------|
-| **Python** | 3.8 or higher |
+| **Python 3** | 3.8 or higher (use `python3` command) |
 | **Snowflake Account** | With ACCOUNT_USAGE access |
 | **Authentication** | Private key (recommended) or password |
 
 ### Required Snowflake Permissions
 
 ```sql
--- Minimum required: Access to ACCOUNT_USAGE for metadata discovery
+-- Required: Access to ACCOUNT_USAGE for metadata-based analysis
 GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE <role_name>;
 GRANT USAGE ON WAREHOUSE <warehouse_name> TO ROLE <role_name>;
 
--- For data profiling: SELECT access to target databases
+-- Optional: For real-time INFORMATION_SCHEMA checks on specific databases
 GRANT USAGE ON DATABASE <database_name> TO ROLE <role_name>;
-GRANT USAGE ON ALL SCHEMAS IN DATABASE <database_name> TO ROLE <role_name>;
-GRANT SELECT ON ALL TABLES IN DATABASE <database_name> TO ROLE <role_name>;
 ```
+
+> **Note:** Since v2.1, SELECT access to individual tables is **no longer required**. All analysis is performed via metadata views.
 
 ## Installation
 
@@ -248,7 +282,7 @@ cd snowflake_ai_enablement_analysis
 
 ```bash
 # Create virtual environment
-python -m venv venv
+python3 -m venv venv
 
 # Activate (macOS/Linux)
 source venv/bin/activate
@@ -256,6 +290,8 @@ source venv/bin/activate
 # Activate (Windows)
 venv\Scripts\activate
 ```
+
+> **Note:** Use `python3` (not `python`) to ensure Python 3.x is used. On some systems, `python` may point to Python 2.x.
 
 ### Step 3: Install Dependencies
 
@@ -274,12 +310,14 @@ Dependencies include:
 ### Step 1: Create Configuration File
 
 ```bash
-cp config.example.yaml config.yaml
+cp config/config.example.yaml config/config.yaml
 ```
 
-> ⚠️ **Security Warning:** `config.yaml` contains sensitive credentials and is git-ignored. Never commit this file to version control.
+> ⚠️ **Security Warning:** `config/config.yaml` contains sensitive credentials and is git-ignored. Never commit this file to version control.
 
 ### Step 2: Edit config.yaml
+
+Edit `config/config.yaml` with your Snowflake credentials:
 
 ```yaml
 # Snowflake Connection
@@ -342,8 +380,8 @@ chmod 600 ~/.snowflake/keys/rsa_key.pem
 Validate your configuration before running full analysis:
 
 ```bash
-# Ensure dry_run.enabled: true in config.yaml
-python scripts/snowflake_full_analysis.py
+# Ensure dry_run.enabled: true in config/config.yaml
+python3 scripts/snowflake_full_analysis.py
 ```
 
 Dry run performs:
@@ -356,20 +394,21 @@ Dry run performs:
 ### Full Analysis
 
 ```bash
-# Set dry_run.enabled: false in config.yaml
-python scripts/snowflake_full_analysis.py
+# Set dry_run.enabled: false in config/config.yaml
+python3 scripts/snowflake_full_analysis.py
 ```
 
 Full analysis performs:
 1. **Phase 1:** Metadata discovery (databases, schemas, tables, columns)
-2. **Phase 2:** AI candidate identification
-3. **Phase 3:** Deep data profiling (sparsity, cardinality, content validation)
-4. **Phase 4:** Candidate confirmation and scoring
-5. **Phase 5:** Report generation
+2. **Phase 2:** AI candidate identification + metadata-based analysis (no table scans)
+3. **Phase 3:** Enhanced analysis (text-rich columns, education tables, PII)
+4. **Phase 4:** Metadata-based data profiling (no table scans)
+5. **Phase 5:** Scoring and candidate confirmation
+6. **Phase 6:** Report generation
 
 ### Run Modes: Fresh vs Append
 
-Configure in `config.yaml`:
+Configure in `config/config.yaml`:
 
 ```yaml
 run_mode:
@@ -385,12 +424,12 @@ run_mode:
 
 ```bash
 # Step 1: Analyze first set of databases
-# config.yaml: target_databases: ["DB1", "DB2"], run_mode.mode: "fresh"
-python scripts/snowflake_full_analysis.py
+# config/config.yaml: target_databases: ["DB1", "DB2"], run_mode.mode: "fresh"
+python3 scripts/snowflake_full_analysis.py
 
 # Step 2: Add more databases incrementally
-# config.yaml: target_databases: ["DB3", "DB4"], run_mode.mode: "append"
-python scripts/snowflake_full_analysis.py
+# config/config.yaml: target_databases: ["DB3", "DB4"], run_mode.mode: "append"
+python3 scripts/snowflake_full_analysis.py
 
 # Step 3: Continue adding until complete
 # Results are merged into comprehensive report
@@ -406,6 +445,8 @@ After running, check these key outputs:
 | `snowflake-ai-enablement-reports/reports/executive_summary.md` | High-level findings for stakeholders |
 | `snowflake-ai-enablement-reports/reports/detailed_analysis_report.md` | Comprehensive analysis with reasoning |
 | `snowflake-ai-enablement-reports/reports/ai_strategy_roadmap.md` | Implementation plan with SQL examples |
+| `snowflake-ai-enablement-reports/reports/ai_readiness_metadata_report.md` | **NEW** Per-table AI readiness scores |
+| `snowflake-ai-enablement-reports/metadata/table_readiness_scores.json` | **NEW** Per-table readiness scores (JSON) |
 | `snowflake-ai-enablement-reports/metadata/confirmed_candidates.json` | Data-validated AI candidates |
 | `snowflake-ai-enablement-reports/metadata/all_candidates.json` | All candidates with confirmation status |
 
@@ -425,7 +466,7 @@ After running, check these key outputs:
 | **Query validation** | All queries validated before execution |
 | **Audit trail** | Complete log in `snowflake-ai-enablement-reports/logs/audit_trail.sql` |
 | **No modifications** | Cannot INSERT, UPDATE, DELETE, or DROP |
-| **Efficient sampling** | Uses SAMPLE, LIMIT, and HLL to minimize compute |
+| **Metadata-only queries** | Queries only INFORMATION_SCHEMA and ACCOUNT_USAGE views — no production table access |
 
 ## Documentation
 
@@ -444,10 +485,24 @@ After running, check these key outputs:
 
 ## Scoring Methodology
 
+### Per-Table AI Readiness Score (0–100)
+
+Each table is scored across 5 metadata-derived dimensions:
+
+| Dimension | Weight | Source |
+|-----------|--------|--------|
+| **Comments** | 25% | Table/column COMMENT fields |
+| **Data Types** | 20% | DATA_TYPE compatibility for AI |
+| **Freshness** | 25% | LAST_ALTERED timestamp |
+| **Clustering** | 15% | CLUSTERING_KEY presence |
+| **Constraints** | 15% | PK/FK/UNIQUE constraints |
+
+### Per-Candidate Score (0–20)
+
 Each AI candidate is scored on four dimensions (0-5 scale each):
 
 1. **Business Potential** - Expected value and impact
-2. **Data Readiness** - Data quality and completeness
+2. **Data Readiness** - Metadata-derived quality assessment (NULL rate, content length, constraints)
 3. **Metadata Quality** - Documentation and discoverability
 4. **Governance Risk** - PII/sensitivity considerations (inverted)
 

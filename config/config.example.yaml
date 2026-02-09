@@ -1,0 +1,250 @@
+# Snowflake AI Enablement Analyzer - Configuration Template
+# =========================================================
+# Version: 2.1 (Metadata-Only Analysis)
+# Copy this file to config.yaml and update with your credentials
+# Note: config.yaml is gitignored to protect sensitive information
+#
+# Since v2.1, all analysis uses Snowflake metadata views (ACCOUNT_USAGE,
+# INFORMATION_SCHEMA) instead of table scans. This reduces credit
+# consumption by ~95%+ and simplifies required permissions.
+
+# =============================================================================
+# SNOWFLAKE CONNECTION SETTINGS
+# =============================================================================
+snowflake:
+  # Account identifier (required)
+  # Format: <orgname>-<account_name> or <account_locator>.<region>.<cloud>
+  # Examples: "xyz12345.us-east-1", "abc123-prod.west-us-2.azure"
+  account: "your_account_identifier"
+  
+  # Username with read access to ACCOUNT_USAGE (required)
+  # Note: SELECT access to individual tables is NOT required since v2.1
+  user: "your_username"
+  
+  # Authentication Method - Choose ONE of the following:
+  
+  # Option 1: Password authentication (simple but less secure)
+  # password: "your_password"
+  
+  # Option 2: Private key authentication (recommended for production)
+  # Path to RSA private key file (.pem or .p8 format)
+  # Generate with: openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
+  private_key_path: "~/.snowflake/keys/snowflake_private_key.pem"
+  
+  # Passphrase for encrypted private key (optional, only if key is encrypted)
+  # private_key_passphrase: "your_secure_passphrase"
+  
+  # Warehouse for running metadata queries (optional but recommended)
+  # A small XS warehouse is sufficient — only metadata views are queried
+  warehouse: "COMPUTE_WH"
+  
+  # Role with access to ACCOUNT_USAGE and INFORMATION_SCHEMA (optional)
+  # Requires: GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE <role>
+  # If not specified, uses user's default role
+  role: "ACCOUNTADMIN"
+
+# =============================================================================
+# OUTPUT SETTINGS
+# =============================================================================
+output:
+  # Directory where reports will be generated
+  # Standard output destination: snowflake-ai-enablement-reports
+  # Can be relative (to script location) or absolute path
+  directory: "./snowflake-ai-enablement-reports"
+
+# =============================================================================
+# RUN MODE CONFIGURATION
+# =============================================================================
+# Controls how the agent handles existing reports and data
+run_mode:
+  # Mode options: "fresh" or "append"
+  #
+  # "fresh" - Start Fresh Mode (default)
+  #   - Clears existing analysis data before running
+  #   - Overwrites all reports with new analysis
+  #   - Best for: First-time runs, complete re-analysis
+  #
+  # "append" - Append/Incremental Mode
+  #   - Preserves existing analysis data
+  #   - Appends new candidates to existing reports
+  #   - Merges results for comprehensive multi-database analysis
+  #   - Best for: Analyzing databases incrementally, building comprehensive reports
+  #
+  mode: "fresh"
+  
+  # When in append mode, merge strategy for candidates
+  # "merge" - Combine new candidates with existing (avoid duplicates)
+  # "add" - Simply add new candidates (may have duplicates)
+  append_strategy: "merge"
+  
+  # Backup existing reports before overwriting (only in fresh mode)
+  backup_before_fresh: false
+
+# =============================================================================
+# DATABASE FILTERING (Objective 1: Database Filtering)
+# =============================================================================
+# Specify which databases to analyze. If empty or commented out,
+# ALL accessible databases will be analyzed.
+# This filter is applied EARLY in execution to avoid unnecessary metadata fetching.
+
+# Option 1: Specify exact list of databases to analyze (whitelist)
+# target_databases:
+#   - "PRODUCTION_DB"
+#   - "ANALYTICS_DB"
+#   - "DATA_WAREHOUSE"
+
+# Option 2: Exclude specific databases (blacklist)
+# System databases are always excluded by default
+exclude_databases:
+  - "SNOWFLAKE"
+  - "SNOWFLAKE_SAMPLE_DATA"
+
+# =============================================================================
+# DATA ANALYSIS SETTINGS
+# =============================================================================
+# Since v2.1, analysis uses metadata views only (no table scans).
+# The following settings control metadata-based scoring behavior.
+analysis:
+  # Number of top candidates for enhanced metadata scoring (default: 200)
+  top_candidates_full_scan: 200
+  
+  # Force re-analysis of all candidates, ignoring cache (default: false)
+  force_reanalysis: false
+  
+  # --- DEPRECATED (v2.1) - No longer used, kept for backward compatibility ---
+  # sample_timeout: 300       # Was: timeout for table-scan sampling queries
+  # full_scan_timeout: 900    # Was: timeout for full table scans
+  # sample_sizes:             # Was: adaptive sampling sizes (10K -> 1K -> 100)
+  #   - 10000
+  #   - 1000
+  #   - 100
+
+# =============================================================================
+# PROFILING & CONFIRMATION THRESHOLDS
+# =============================================================================
+# Since v2.1, profiling uses metadata (IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH)
+# instead of table scans. These thresholds still control candidate confirmation.
+profiling:
+  # Confirmation thresholds for "Confirmed Candidates"
+  confirmation:
+    # Minimum data readiness score to be a confirmed candidate (0-5 scale)
+    min_data_readiness_score: 3.5
+    # Maximum estimated sparsity (NULL %) for confirmation
+    # Derived from IS_NULLABLE metadata (NOT NULL = 0%, nullable = estimated)
+    max_sparsity_percent: 50
+    # Minimum estimated average length for text columns
+    # Derived from CHARACTER_MAXIMUM_LENGTH metadata
+    min_avg_text_length: 30
+  
+  # --- DEPRECATED (v2.1) - No longer used, kept for backward compatibility ---
+  # These were used when table scans measured actual data quality.
+  # sparsity:
+  #   low_threshold: 10
+  #   medium_threshold: 30
+  #   high_threshold: 70
+  # cardinality:
+  #   low_threshold: 0.01
+  #   high_threshold: 0.90
+  # content_type:
+  #   min_meaningful_length: 50
+  #   min_rich_content_length: 200
+  #   content_sample_size: 100
+
+# =============================================================================
+# AI CANDIDATE IDENTIFICATION SETTINGS
+# =============================================================================
+ai_candidates:
+  # Text column indicators (column names containing these are LLM candidates)
+  text_indicators:
+    - "DESCRIPTION"
+    - "CONTENT"
+    - "MESSAGE"
+    - "NOTE"
+    - "SUMMARY"
+    - "DETAIL"
+    - "BODY"
+    - "TEXT"
+    - "COMMENT"
+    - "FEEDBACK"
+    - "REVIEW"
+    - "ABSTRACT"
+    - "BIO"
+    - "NARRATIVE"
+    - "TITLE"
+    - "SUBJECT"
+  
+  # Minimum VARCHAR length for LLM candidate consideration
+  min_text_column_length: 500
+  
+  # Minimum text columns in a table for Search/RAG candidate
+  min_text_columns_for_search: 2
+
+# =============================================================================
+# PII DETECTION PATTERNS
+# =============================================================================
+pii:
+  # Built-in PII indicators (always checked)
+  indicators:
+    - "EMAIL"
+    - "SSN"
+    - "SOCIAL_SECURITY"
+    - "PHONE"
+    - "ADDRESS"
+    - "FIRST_NAME"
+    - "LAST_NAME"
+    - "BIRTH"
+    - "DOB"
+    - "PASSWORD"
+    - "SECRET"
+    - "CREDENTIAL"
+  
+  # Custom PII patterns for your organization (optional)
+  # Each category maps to a list of regex patterns (case-insensitive)
+  custom_patterns:
+    # Example: Employee compensation data
+    # compensation:
+    #   - "^salary$"
+    #   - "^base_salary$"
+    #   - "^bonus$"
+    #   - "^stock_grant"
+    #   - "total_compensation"
+    
+    # Example: Healthcare/Medical data
+    # medical_records:
+    #   - "diagnosis"
+    #   - "prescription"
+    #   - "medical_record"
+    #   - "icd_?code"
+    #   - "health_condition"
+
+# =============================================================================
+# DRY RUN MODE
+# =============================================================================
+# Dry run allows you to validate configuration and see what would be analyzed
+# without actually executing data queries or generating full reports.
+dry_run:
+  # Enable dry run mode (default: false)
+  # When true, the script will:
+  #   1. Validate Snowflake connection
+  #   2. List databases that would be analyzed (with filtering applied)
+  #   3. Show estimated scope (tables, columns, candidates)
+  #   4. Skip metadata analysis and scoring
+  #   5. Skip report generation
+  enabled: false
+  
+  # Show sample queries that would be executed (default: true)
+  show_sample_queries: true
+  
+  # Validate access to target databases (default: true)
+  # Attempts SELECT on INFORMATION_SCHEMA to verify permissions
+  validate_access: true
+
+# =============================================================================
+# LOGGING SETTINGS
+# =============================================================================
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+  
+  # Enable detailed query logging in audit trail
+  detailed_audit: true

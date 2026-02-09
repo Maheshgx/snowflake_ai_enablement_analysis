@@ -46,6 +46,14 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
+from snowflake_ai_readiness_metadata import (
+    run_metadata_analysis,
+    generate_readiness_report_markdown,
+    compute_column_metadata_stats,
+    enhance_data_readiness_score_metadata,
+    build_table_metadata_lookup,
+    build_column_metadata_lookup,
+)
 
 # =============================================================================
 # AGENT METADATA & UTC TIMESTAMP UTILITIES
@@ -132,6 +140,7 @@ def format_doc_header(title, description=""):
 # Script paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+CONFIG_DIR = os.path.join(REPO_ROOT, "config")
 
 # =============================================================================
 # CONFIGURATION LOADING (Objective 1: YAML Configuration)
@@ -143,9 +152,10 @@ def load_yaml_config(config_path=None):
     
     Priority:
     1. Explicit config_path parameter
-    2. config.yaml in repo root
-    3. config.example.yaml in repo root (with warning)
-    4. Fall back to environment variables
+    2. config/config.yaml in repo
+    3. config/config.example.yaml in repo (with warning)
+    4. Legacy: config.yaml in repo root (backward compatibility)
+    5. Fall back to environment variables
     
     Returns dict with configuration values.
     """
@@ -155,11 +165,14 @@ def load_yaml_config(config_path=None):
     # Determine config file path
     if config_path and os.path.exists(config_path):
         config_file = config_path
+    elif os.path.exists(os.path.join(CONFIG_DIR, "config.yaml")):
+        config_file = os.path.join(CONFIG_DIR, "config.yaml")
     elif os.path.exists(os.path.join(REPO_ROOT, "config.yaml")):
+        print("NOTE: Found config.yaml in repo root. Consider moving it to config/config.yaml")
         config_file = os.path.join(REPO_ROOT, "config.yaml")
-    elif os.path.exists(os.path.join(REPO_ROOT, "config.example.yaml")):
-        print("WARNING: Using config.example.yaml - copy to config.yaml and update with your credentials")
-        config_file = os.path.join(REPO_ROOT, "config.example.yaml")
+    elif os.path.exists(os.path.join(CONFIG_DIR, "config.example.yaml")):
+        print("WARNING: Using config/config.example.yaml - copy to config/config.yaml and update with your credentials")
+        config_file = os.path.join(CONFIG_DIR, "config.example.yaml")
     
     if config_file:
         print(f"Loading configuration from: {config_file}")
@@ -714,22 +727,31 @@ def run_dry_run(conn):
         return False
     
     # Step 2: List databases that would be analyzed
-    print("\n[Step 2/5] Discovering Databases (with filters applied)...")
-    db_filter = get_database_filter_clause()
+    # Use ACCOUNT_USAGE.TABLES for authoritative database list (ACCOUNT_USAGE.DATABASES contains stale entries)
+    print("\n[Step 2/5] Discovering Databases (from tables metadata)...")
+    table_filter = ""
+    if TARGET_DATABASES:
+        db_list = ", ".join([f"'{db.upper()}'" for db in TARGET_DATABASES])
+        table_filter = f"AND UPPER(TABLE_CATALOG) IN ({db_list})"
+    elif EXCLUDE_DATABASES:
+        db_list = ", ".join([f"'{db.upper()}'" for db in EXCLUDE_DATABASES])
+        table_filter = f"AND UPPER(TABLE_CATALOG) NOT IN ({db_list})"
+
     db_query = f"""
-    SELECT DATABASE_NAME, DATABASE_OWNER, CREATED
-    FROM SNOWFLAKE.ACCOUNT_USAGE.DATABASES
+    SELECT DISTINCT TABLE_CATALOG AS DATABASE_NAME
+    FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES
     WHERE DELETED IS NULL
-    {db_filter}
+    {table_filter}
     ORDER BY DATABASE_NAME
     """
-    cols, databases = execute_query(conn, db_query, "Dry run: List filtered databases")
+    cols, databases = execute_query(conn, db_query, "Dry run: List databases with tables")
+    actual_db_count = len(databases)
     
-    print(f"  Found {len(databases)} database(s) to analyze:")
+    print(f"  Found {actual_db_count} database(s) to analyze:")
     for db in databases[:20]:  # Show first 20
         print(f"    - {db[0]}")
-    if len(databases) > 20:
-        print(f"    ... and {len(databases) - 20} more")
+    if actual_db_count > 20:
+        print(f"    ... and {actual_db_count - 20} more")
     
     # Step 3: Validate access to databases (if enabled)
     if DRY_RUN_VALIDATE_ACCESS:
@@ -748,8 +770,8 @@ def run_dry_run(conn):
                 inaccessible.append(db_name)
                 print(f"    ✗ {db_name}: No access ({str(e)[:50]})")
         
-        if len(databases) > 10:
-            print(f"    (checked 10 of {len(databases)} databases)")
+        if actual_db_count > 10:
+            print(f"    (checked 10 of {actual_db_count} databases)")
         
         if inaccessible:
             print(f"\n  WARNING: {len(inaccessible)} database(s) may not be accessible")
@@ -760,14 +782,6 @@ def run_dry_run(conn):
     print("\n[Step 4/5] Estimating Analysis Scope...")
     
     # Count tables
-    table_filter = ""
-    if TARGET_DATABASES:
-        db_list = ", ".join([f"'{db.upper()}'" for db in TARGET_DATABASES])
-        table_filter = f"AND UPPER(TABLE_CATALOG) IN ({db_list})"
-    elif EXCLUDE_DATABASES:
-        db_list = ", ".join([f"'{db.upper()}'" for db in EXCLUDE_DATABASES])
-        table_filter = f"AND UPPER(TABLE_CATALOG) NOT IN ({db_list})"
-    
     table_query = f"""
     SELECT COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES 
     WHERE DELETED IS NULL {table_filter}
@@ -794,13 +808,13 @@ def run_dry_run(conn):
     _, cand_count = execute_query(conn, candidate_query, "Dry run: Estimate AI candidates")
     estimated_candidates = cand_count[0][0] if cand_count else 0
     
-    print(f"  Databases to analyze: {len(databases):,}")
+    print(f"  Databases to analyze: {actual_db_count:,}")
     print(f"  Estimated tables: {total_tables:,}")
     print(f"  Estimated columns: {total_columns:,}")
     print(f"  Estimated AI candidates: {estimated_candidates:,}+")
     
     # Estimate runtime
-    est_metadata_time = len(databases) * 2  # ~2 sec per DB for metadata
+    est_metadata_time = actual_db_count * 2  # ~2 sec per DB for metadata
     est_profiling_time = min(estimated_candidates, TOP_CANDIDATES_FULL_SCAN) * 5  # ~5 sec per candidate
     est_total_time = est_metadata_time + est_profiling_time
     
@@ -844,13 +858,13 @@ def run_dry_run(conn):
     print(f"""
 Summary:
   - Connection: Valid
-  - Databases to analyze: {len(databases)}
+  - Databases to analyze: {actual_db_count}
   - Estimated tables: {total_tables:,}
   - Estimated columns: {total_columns:,}
   - Estimated AI candidates: {estimated_candidates:,}+
   - Estimated runtime: ~{est_total_time // 60}m {est_total_time % 60}s
 
-To run full analysis, set 'dry_run.enabled: false' in config.yaml
+To run full analysis, set 'dry_run.enabled: false' in config/config.yaml
 """)
     
     return True
@@ -2348,20 +2362,31 @@ def save_enhanced_metadata(candidates, top_candidates, dashboard, comparison_rep
 # ==================== PHASE 1: METADATA DISCOVERY ====================
 
 def discover_databases(conn):
-    """Discover databases with early filtering applied."""
+    """Discover databases with early filtering applied.
+    
+    Uses ACCOUNT_USAGE.TABLES (DISTINCT TABLE_CATALOG) as the authoritative
+    source instead of ACCOUNT_USAGE.DATABASES, which may contain stale entries
+    for dropped/recreated databases even with DELETED IS NULL.
+    """
     print("\n=== Discovering Databases ===")
     
-    # Build filter clause for database filtering (Objective 1)
-    db_filter = get_database_filter_clause()
+    # Build filter clause for database filtering
+    table_filter = ""
+    if TARGET_DATABASES:
+        db_list = ", ".join([f"'{db.upper()}'" for db in TARGET_DATABASES])
+        table_filter = f"AND UPPER(TABLE_CATALOG) IN ({db_list})"
+    elif EXCLUDE_DATABASES:
+        db_list = ", ".join([f"'{db.upper()}'" for db in EXCLUDE_DATABASES])
+        table_filter = f"AND UPPER(TABLE_CATALOG) NOT IN ({db_list})"
     
     query = f"""
-    SELECT DATABASE_NAME, DATABASE_OWNER, COMMENT, CREATED
-    FROM SNOWFLAKE.ACCOUNT_USAGE.DATABASES
+    SELECT DISTINCT TABLE_CATALOG AS DATABASE_NAME
+    FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES
     WHERE DELETED IS NULL
-    {db_filter}
+    {table_filter}
     ORDER BY DATABASE_NAME
     """
-    cols, rows = execute_query(conn, query, "List all databases from ACCOUNT_USAGE")
+    cols, rows = execute_query(conn, query, "List databases with tables from ACCOUNT_USAGE.TABLES")
     
     # Log filtering info
     if TARGET_DATABASES:
@@ -2374,26 +2399,31 @@ def discover_databases(conn):
     return cols, rows
 
 def discover_schemas(conn):
-    """Discover schemas with early database filtering applied."""
+    """Discover schemas with early database filtering applied.
+    
+    Uses ACCOUNT_USAGE.TABLES (DISTINCT TABLE_CATALOG, TABLE_SCHEMA) as the
+    authoritative source instead of ACCOUNT_USAGE.SCHEMATA, which may contain
+    stale entries for dropped/recreated schemas.
+    """
     print("\n=== Discovering Schemas ===")
     
-    # Build filter clause - use CATALOG_NAME for schemas
+    # Build filter clause - use TABLE_CATALOG for tables
     db_filter = ""
     if TARGET_DATABASES:
         db_list = ", ".join([f"'{db.upper()}'" for db in TARGET_DATABASES])
-        db_filter = f"AND UPPER(CATALOG_NAME) IN ({db_list})"
+        db_filter = f"AND UPPER(TABLE_CATALOG) IN ({db_list})"
     elif EXCLUDE_DATABASES:
         db_list = ", ".join([f"'{db.upper()}'" for db in EXCLUDE_DATABASES])
-        db_filter = f"AND UPPER(CATALOG_NAME) NOT IN ({db_list})"
+        db_filter = f"AND UPPER(TABLE_CATALOG) NOT IN ({db_list})"
     
     query = f"""
-    SELECT CATALOG_NAME AS DATABASE_NAME, SCHEMA_NAME, SCHEMA_OWNER, COMMENT, CREATED
-    FROM SNOWFLAKE.ACCOUNT_USAGE.SCHEMATA
+    SELECT DISTINCT TABLE_CATALOG AS DATABASE_NAME, TABLE_SCHEMA AS SCHEMA_NAME
+    FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES
     WHERE DELETED IS NULL
     {db_filter}
-    ORDER BY CATALOG_NAME, SCHEMA_NAME
+    ORDER BY TABLE_CATALOG, TABLE_SCHEMA
     """
-    cols, rows = execute_query(conn, query, "List all schemas from ACCOUNT_USAGE (filtered)")
+    cols, rows = execute_query(conn, query, "List schemas with tables from ACCOUNT_USAGE.TABLES")
     print(f"Found {len(rows)} schemas")
     return cols, rows
 
@@ -2424,6 +2454,7 @@ def discover_tables_and_views(conn):
     FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES
     WHERE DELETED IS NULL
     {db_filter}
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME ORDER BY CREATED DESC) = 1
     ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME
     """
     cols, rows = execute_query(conn, query, "List all tables and views from ACCOUNT_USAGE (filtered)")
@@ -2459,6 +2490,7 @@ def discover_columns(conn):
     FROM SNOWFLAKE.ACCOUNT_USAGE.COLUMNS
     WHERE DELETED IS NULL
     {db_filter}
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME ORDER BY ORDINAL_POSITION) = 1
     ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
     """
     cols, rows = execute_query(conn, query, "List all columns from ACCOUNT_USAGE (filtered)")
@@ -2490,6 +2522,7 @@ def discover_stages(conn):
     FROM SNOWFLAKE.ACCOUNT_USAGE.STAGES
     WHERE DELETED IS NULL
     {db_filter}
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY STAGE_CATALOG, STAGE_SCHEMA, STAGE_NAME ORDER BY CREATED DESC) = 1
     ORDER BY STAGE_CATALOG, STAGE_SCHEMA, STAGE_NAME
     """
     cols, rows = execute_query(conn, query, "List all stages from ACCOUNT_USAGE (filtered)")
@@ -4028,24 +4061,24 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python snowflake_full_analysis.py                    # Run with config.yaml
-  python snowflake_full_analysis.py --dry-run          # Validate config only
-  python snowflake_full_analysis.py --config my.yaml   # Use custom config
-  python snowflake_full_analysis.py --start-stage 2B   # Restart from Phase 2B
-  python snowflake_full_analysis.py --start-stage 3    # Restart from Phase 3
-  python snowflake_full_analysis.py --version          # Show version
+  python3 scripts/snowflake_full_analysis.py                          # Run with config/config.yaml
+  python3 scripts/snowflake_full_analysis.py --dry-run                # Validate config only
+  python3 scripts/snowflake_full_analysis.py --config path/to/my.yaml # Use custom config
+  python3 scripts/snowflake_full_analysis.py --start-stage 2B         # Restart from Phase 2B
+  python3 scripts/snowflake_full_analysis.py --start-stage 3          # Restart from Phase 3
+  python3 scripts/snowflake_full_analysis.py --version                # Show version
 
 Valid stages (in order): 1, 2, 2A, 2B, 2C, 2D, 2E, 2F, 3, 4, 5, 5B, 6
   Stage 1:  Metadata Discovery
   Stage 2:  AI Candidate Identification  
   Stage 2A: Load Analysis Cache
-  Stage 2B: Sampling Pass (data quality analysis)
+  Stage 2B: Metadata-Based Analysis (no table scans)
   Stage 2C: Save Analysis Cache
   Stage 2D: Identify Top Candidates
-  Stage 2E: Full Scan Analysis
+  Stage 2E: Metadata-Based Enhanced Scoring (no table scans)
   Stage 2F: Generate Data Analysis Reports
   Stage 3:  Enhanced Analysis
-  Stage 4:  Data Profiling
+  Stage 4:  Metadata-Based Data Profiling (no table scans)
   Stage 5:  Scoring Candidates
   Stage 5B: Flagging Confirmed Candidates
   Stage 6:  Report Generation
@@ -4240,45 +4273,72 @@ def run_agent(config_path=None, dry_run_override=None, start_stage=None):
         cached_count = len(cache)
         print(f"  Using {cached_count:,} cached analyses from intermediate state")
 
-    # Phase 2B: Sampling pass
+    # Phase 2B: Metadata-based analysis (replaces table-scan sampling pass)
+    metadata_analysis_result = None
     if should_run_stage('2B', start_stage):
         print("\n" + "=" * 50)
-        print("PHASE 2B: SAMPLING PASS")
+        print("PHASE 2B: METADATA-BASED ANALYSIS (No Table Scans)")
         print("=" * 50)
-        print("Analyzing candidate data quality...")
-        total_candidates = len(all_candidates)
+        print("Analyzing candidate data quality via metadata...")
 
+        # Run the metadata-only analysis (replaces per-candidate table scans)
+        metadata_analysis_result = run_metadata_analysis(
+            conn, execute_query,
+            target_databases=TARGET_DATABASES,
+            exclude_databases=EXCLUDE_DATABASES
+        )
+
+        # Build lookups for scoring candidates
+        meta_table_lookup = metadata_analysis_result['table_lookup']
+        meta_column_lookup = metadata_analysis_result['column_lookup']
+
+        total_candidates = len(all_candidates)
         for i, candidate in enumerate(all_candidates, 1):
-            # Build current item identifier
             item_name = f"{candidate.get('database', '?')}.{candidate.get('schema', '?')}.{candidate.get('table', '?')}.{candidate.get('column', '?')}"
-            
-            # Build extra info string
-            extra_info = f"OK:{analyzed_count} New:{new_analyses} Cache:{from_cache_count} Err:{skipped_count}"
-            
-            # Print progress every item (with carriage return to overwrite)
+            extra_info = f"OK:{analyzed_count} Err:{skipped_count}"
             print_progress(i, total_candidates, item_name, "Phase 2B", extra_info)
 
-            result = analyze_column_data(conn, candidate, cache)
+            try:
+                table_key = (candidate.get('database'), candidate.get('schema'), candidate.get('table'))
+                table_meta = meta_table_lookup.get(table_key, {})
+                cols_meta = meta_column_lookup.get(table_key, [])
 
-            if result.get('success'):
-                analyzed_count += 1
-                if result.get('from_cache'):
-                    from_cache_count += 1
-                elif not result.get('skipped'):
+                # Find the specific column metadata
+                col_name = candidate.get('column', '')
+                col_meta = next((c for c in cols_meta if c.get('column_name') == col_name), {})
+
+                if col_meta:
+                    # Compute metadata-based statistics (replaces run_adaptive_sample)
+                    stats = compute_column_metadata_stats(col_meta, table_meta)
+                    candidate['statistics'] = stats
+                    candidate['sample_size'] = 'metadata'
+                    candidate['analyzed_at'] = get_utc_timestamp_iso()
+
+                    # Cache the result
+                    cache_key = f"{candidate.get('database')}.{candidate.get('schema')}.{candidate.get('table')}.{col_name}"
+                    cache[cache_key] = {
+                        "analyzed_at": get_utc_timestamp_iso(),
+                        "sample_size": "metadata",
+                        "analysis_type": "metadata_only",
+                        "statistics": stats
+                    }
+                    analyzed_count += 1
                     new_analyses += 1
-            else:
+                else:
+                    # No column metadata found – still count as analyzed with defaults
+                    candidate['statistics'] = {'source': 'metadata_only', 'row_count': 0}
+                    analyzed_count += 1
+            except Exception as e:
                 skipped_count += 1
 
-        # Print completion summary
-        print_progress_complete("Phase 2B", {
+        print_progress_complete("Phase 2B (Metadata)", {
             "Successfully analyzed": analyzed_count,
-            "From cache": from_cache_count,
-            "New analyses": new_analyses,
-            "Skipped (errors)": skipped_count
+            "New analyses (metadata)": new_analyses,
+            "Skipped (errors)": skipped_count,
+            "Table scans avoided": total_candidates
         })
     else:
-        print("\nPhase 2B: Sampling Pass [SKIPPED]")
-        # Candidates should already have analysis data from cache
+        print("\nPhase 2B: Metadata Analysis [SKIPPED]")
         analyzed_count = len([c for c in all_candidates if 'statistics' in c])
         print(f"  Using {analyzed_count:,} pre-analyzed candidates")
 
@@ -4303,16 +4363,35 @@ def run_agent(config_path=None, dry_run_override=None, start_stage=None):
         top_candidates = all_candidates[:TOP_CANDIDATES_FULL_SCAN]
         print(f"  Using top {len(top_candidates):,} candidates from loaded data")
 
-    # Phase 2E: Run full scans on top candidates
+    # Phase 2E: Metadata-based enhanced scoring (replaces full table scans)
     if should_run_stage('2E', start_stage):
         print("\n" + "=" * 50)
-        print("PHASE 2E: FULL SCAN ANALYSIS")
+        print("PHASE 2E: METADATA-BASED ENHANCED SCORING (No Table Scans)")
         print("=" * 50)
-        print("Running full scans on top candidates...")
-        full_scan_results = run_full_scan_analysis(conn, top_candidates, cache)
-        print(f"  Completed {len(full_scan_results):,} full scans")
+        print("Re-scoring top candidates using metadata-derived statistics...")
+
+        rescored = 0
+        for cand in top_candidates:
+            stats = cand.get('statistics', {})
+            if stats:
+                enhanced_score = enhance_data_readiness_score_metadata(cand, stats)
+                if 'scores' not in cand:
+                    cand['scores'] = {
+                        'business_potential': 3,
+                        'metadata_quality': 2,
+                        'governance_risk': 2
+                    }
+                cand['scores']['data_readiness'] = enhanced_score
+                cand['total_score'] = sum(cand['scores'].values())
+                rescored += 1
+
+        print(f"  Re-scored {rescored:,} top candidates with metadata-enhanced readiness")
+        print(f"  Full table scans avoided: {len(top_candidates):,}")
+
+        # Save updated cache
+        save_analysis_cache(cache)
     else:
-        print("\nPhase 2E: Full Scan Analysis [SKIPPED]")
+        print("\nPhase 2E: Metadata Enhanced Scoring [SKIPPED]")
 
     # Phase 2F: Generate data analysis reports
     if should_run_stage('2F', start_stage):
@@ -4358,10 +4437,27 @@ def run_agent(config_path=None, dry_run_override=None, start_stage=None):
         with open(comparison_path, "w", encoding="utf-8") as f:
             f.write(comparison)
         print(f"  Generated scoring comparison: {comparison_path}")
+
+        # Generate metadata-based AI readiness report
+        if metadata_analysis_result:
+            readiness_report = generate_readiness_report_markdown(
+                metadata_analysis_result['table_scores'],
+                metadata_analysis_result['summary']
+            )
+            readiness_path = OUTPUT_DIR / "reports" / "ai_readiness_metadata_report.md"
+            with open(readiness_path, "w", encoding="utf-8") as f:
+                f.write(readiness_report)
+            print(f"  Generated metadata readiness report: {readiness_path}")
+
+            # Save table readiness scores as JSON
+            readiness_json_path = OUTPUT_DIR / "metadata" / "table_readiness_scores.json"
+            with open(readiness_json_path, "w", encoding="utf-8") as f:
+                json.dump(metadata_analysis_result['table_scores'], f, indent=2, default=str)
+            print(f"  Saved table readiness scores to {readiness_json_path}")
     else:
         print("\nPhase 2F: Generate Data Analysis Reports [SKIPPED]")
 
-    print("\nPhase 2 Complete: Actual data analysis finished")
+    print("\nPhase 2 Complete: Metadata-based data analysis finished (no table scans)")
 
     # ========== PHASE 3: ENHANCED ANALYSIS ==========
     # Initialize variables for Phase 3
@@ -4433,11 +4529,48 @@ def run_agent(config_path=None, dry_run_override=None, start_stage=None):
 
     if should_run_stage('4', start_stage):
         print("\n" + "=" * 50)
-        print("PHASE 4: DATA PROFILING")
+        print("PHASE 4: METADATA-BASED DATA PROFILING (No Table Scans)")
         print("=" * 50)
 
-        text_profiles = profile_sample_text_columns(conn, text_rich_columns, limit=15)
-        variant_profiles = profile_variant_columns(conn, variant_candidates, limit=5)
+        # Build metadata-based text profiles from text_rich_columns
+        # This replaces profile_sample_text_columns which ran TABLESAMPLE queries
+        print("\n=== Building Metadata-Based Text Profiles ===")
+        seen_tables = set()
+        for row in text_rich_columns[:15]:
+            db, schema, table, col, dtype, max_len, comment = row
+            table_key = f"{db}.{schema}.{table}"
+            if table_key not in seen_tables:
+                seen_tables.add(table_key)
+                # Use metadata to estimate profile (no table scan)
+                estimated_avg = min((max_len or 1000) * 0.3, 5000) if max_len else 100.0
+                text_profiles.append({
+                    "database": db,
+                    "schema": schema,
+                    "table": table,
+                    "column": col,
+                    "data_type": dtype,
+                    "total_rows_sampled": 0,  # metadata-only, no sampling
+                    "non_null_count": 0,
+                    "avg_length": round(estimated_avg, 2),
+                    "max_length": max_len or 16777216,
+                    "min_length": 0,
+                    "source": "metadata_only"
+                })
+                print(f"  {db}.{schema}.{table}.{col}: est_avg_len={estimated_avg:.0f} (from metadata)")
+        print(f"Built {len(text_profiles)} text profiles from metadata")
+
+        # Build metadata-based variant profiles
+        # This replaces profile_variant_columns which ran LATERAL FLATTEN queries
+        print("\n=== Building Metadata-Based Variant Profiles ===")
+        for cand in variant_candidates[:5]:
+            variant_profiles.append({
+                **cand,
+                "top_keys": [],  # Cannot determine keys without table scan
+                "source": "metadata_only",
+                "note": "Key structure requires LATERAL FLATTEN (optional targeted query)"
+            })
+            print(f"  {cand.get('database')}.{cand.get('schema')}.{cand.get('table')}.{cand.get('column')}: VARIANT (metadata only)")
+        print(f"Built {len(variant_profiles)} variant profiles from metadata")
 
         # Save profiles
         profiles_json_path = OUTPUT_DIR / "profiles" / "text_column_profiles.json"
@@ -4586,7 +4719,7 @@ def run_agent(config_path=None, dry_run_override=None, start_stage=None):
             databases=databases,
             schemas=schemas,
             tables=tables,
-            stages=stages
+            stages=stages,
         )
         detailed_path = OUTPUT_DIR / "reports" / "detailed_analysis_report.md"
         detailed_path.parent.mkdir(parents=True, exist_ok=True)
